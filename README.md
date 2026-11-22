@@ -64,11 +64,24 @@ recruit's original name. Keep the 128 KiB backup to retain its custom names.
 
 ## Build from source
 
-Use Python 3.10 or later, Clang with the ARM bare-metal target, and GNU
-Arm Embedded binutils (`arm-none-eabi-ld`, `nm`, and `objcopy`).
+Install Python 3.10 or later, Clang with the `arm-none-eabi` target, and GNU
+Arm Embedded binutils (`arm-none-eabi-ld`, `arm-none-eabi-nm`, and
+`arm-none-eabi-objcopy`). From the repository root, run the following command
+with your own clean North American ROM and a new IPS path outside the checkout.
 
 ```sh
-python3 tools/build_patch.py --retail /path/to/ffta-us.gba --output /path/to/ffta-us-recruit-naming.ips
+./build.sh --retail /path/to/ffta-us.gba --output /path/to/ffta-us-recruit-naming.ips
+```
+
+The script checks the ROM's SHA-256, compiles the C source, and verifies the
+generated IPS by applying it in memory. The IPS is the only output file. The
+build report and SHA-256 checksums go to standard output. Use `./build.sh --help`
+for toolchain overrides. On systems without a POSIX shell, run
+`python3 tools/build_patch.py` with the same arguments.
+
+Run the tests independently with the following command.
+
+```sh
 python3 -m unittest discover -s tests
 ```
 
