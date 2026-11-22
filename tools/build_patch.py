@@ -116,6 +116,7 @@ def install(rom, symbols, sections):
     for offset in (0x70E10, 0x70F58):
         add('recruit scene callback', offset, struct.pack('<I', symbols['RecruitStep']),
             struct.pack('<I', 0x080802E5))
+    redirect('identify recruit Flash', 0x141DAC, 'IdentifyRecruitFlash', 0x1418C0)
     redirect('dialog text', 0x1181A, 'DialogBridge', 0x18028)
     for offset in (0x743F6, 0x7563C):
         redirect('unit display name', offset, 'RenderNameBridge', 0xC7EA4)

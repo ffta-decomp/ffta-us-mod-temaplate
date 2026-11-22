@@ -489,7 +489,7 @@ void SaveHeap(void)
 
 static unsigned supports_bank(void)
 {
-    return RAM(void *, SAVE_DEVICE) && FlashId() == 0x1362;
+    return RAM(void *, SAVE_DEVICE) && FlashId() == FLASH_ID_SANYO_1M;
 }
 
 static void switch_bank(u8 bank)
@@ -498,6 +498,20 @@ static void switch_bank(u8 bank)
     RAM(volatile u8, 0x0e002aaa) = 0x55;
     RAM(volatile u8, 0x0e005555) = 0xb0;
     RAM(volatile u8, 0x0e000000) = bank;
+}
+
+/* mGBA starts AFXE as Flash 512 Kbit and upgrades on the first Bank 1
+ * selection. Restore Bank 0 before the native driver selects its descriptor. */
+__attribute__((section(".bridge")))
+u16 IdentifyRecruitFlash(void)
+{
+    u16 id = FlashId();
+    if (id == FLASH_ID_PANASONIC_512) {
+        switch_bank(1);
+        switch_bank(0);
+        id = FlashId();
+    }
+    return id;
 }
 
 static unsigned read_names(const u8 *image, u8 slot, u8 sector)

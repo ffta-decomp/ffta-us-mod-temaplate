@@ -73,6 +73,7 @@ _Static_assert(__builtin_offsetof(struct NameEditor, phase) == 0x330, "editor ph
 #define CopyRecord NATIVE(0x081443fc, void *, (void *, const void *, unsigned))
 #define NativeWrite NATIVE(0x08141d10, u32, (u16, const void *))
 #define NativeRead NATIVE(0x08141b14, void, (u16, u32, void *, u32))
+enum { FLASH_ID_PANASONIC_512 = 0x1b32, FLASH_ID_SANYO_1M = 0x1362 };
 #define FlashId NATIVE(0x081418c0, u16, (void))
 #define NameCrc NATIVE(0x0813adf0, u32, (const void *, u32, u32))
 

@@ -2,15 +2,15 @@
 
 ## ROM changes
 
-The input and output ROMs are both 16 MiB. The v1.0.0 IPS is 4,021 bytes and
-changes 3,843 ROM bytes. The input SHA-256 is checked before building.
+The input and output ROMs are both 16 MiB. The v1.0.1 IPS is 4,118 bytes and
+changes 3,935 ROM bytes. The input SHA-256 is checked before building.
 Clang compiles the C implementation. GNU Arm Embedded binutils link
 and extract the payload.
 
 | ROM file offset | Purpose | Bytes |
 | --- | --- | ---: |
 | `0xE02000` | Recruit code and read-only tables | 3,548 |
-| `0x36D370` | Nearby call bridges | 160 |
+| `0x36D370` | Nearby call bridges and startup Flash probe | 248 |
 | `0xF30000` | Flash descriptor table with the Sanyo 1 Mbit entry | 64 |
 
 The three payloads occupy erased space checked by the builder. The remaining
@@ -41,9 +41,19 @@ name-record CRC. A missing or stale block leaves the corresponding recruit's
 original name visible. The program returns to Flash bank 0 after accessing the
 name bank.
 
+At the startup Flash ID call (`0x141DAC`), the patch probes Bank 1 only
+when the detected Flash presents ID `0x1B32`. It returns to Bank 0 and
+reads the ID again before the native driver selects its descriptor.
+mGBA upgrades its emulated Flash on that Bank 1 command. The probe sends only bank-select
+and ID commands and uses the existing memory layout. Both the
+`AFXE` game code and aligned `FLASH1M_V103` marker are retained.
+
 ## Validation
 
 - Rebuilt the IPS twice and compared the results byte for byte.
+- Verified mGBA 0.10.5 default detection with an empty battery file, a 64 KiB save,
+  and a 128 KiB save from v1.0.0. Expansion preserves all existing bytes
+  and fills the newly added bank with `0xFF`.
 - Entered the recruit scene from a US battery save in mGBA with a candidate
   produced by the game's generator and a scene arena allocated by the native
   allocator. Used game controls to name the recruit, confirm, save, and read

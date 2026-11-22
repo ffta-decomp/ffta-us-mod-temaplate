@@ -13,9 +13,9 @@ card and unit details.
 2. Download the IPS patch from [Releases](https://github.com/ffta-decomp/ffta-us-mod-temaplate/releases).
 3. Apply it to a clean 16 MiB North American ROM with game code `AFXE` and
    the SHA-256 below. Use a separate filename for the patched ROM.
-4. Configure your emulator to use **Flash 1 Mbit (128 KiB)** for the patched
-   ROM. In mGBA, set the cartridge override before booting the game because
-   the `AFXE` preset can select the stock 64 KiB device.
+4. Use **Flash 1 Mbit (128 KiB)**. In mGBA, v1.0.1 expands the save
+   automatically at boot with default settings. If your emulator still
+   uses 64 KiB, set its cartridge override to Flash 1 Mbit.
 
 ```text
 43fc8204c6dceee58828aebc7af0c72eb807e99f35ad641c8bb0a4fa8b6edc19
@@ -24,8 +24,13 @@ card and unit details.
 ## Expand an existing save
 
 Close the emulator or fully unload the game before copying battery saves.
-Use the original raw 64 KiB `.sav` as input, then import the new file for the
-patched ROM.
+Use a copy of your save with the patched ROM. mGBA preserves the original
+64 KiB and fills the added bank with erased bytes. An existing 128 KiB
+save from v1.0.0 works without conversion.
+
+For VBA-M or a setup that needs manual migration, expand the save before
+importing it. VBA-M can select 64 KiB again when it loads a raw 64 KiB
+battery file.
 
 ```sh
 python3 tools/save_file.py expand original.sav recruit-naming.sav
@@ -41,10 +46,11 @@ always a new file.
 
 - The patch targets the exact clean US ROM above. Use it on its own. Other
   game revisions, translations, and patch combinations are unsupported.
-- The tested setup is mGBA using Flash 1 Mbit with the Sanyo-compatible
-  Flash ID. With a stock 64 KiB Flash device, ordinary recruitment keeps
-  its original behavior. Emulator save states are tied to their ROM build
-  and should be discarded when switching builds.
+- Automatic expansion was tested on mGBA. Other emulators may require
+  a manual setting or an expanded save. If the game detects only 64 KiB
+  Flash after the probe, ordinary recruitment keeps its original behavior.
+  Use battery saves when switching builds, since emulator save states
+  are tied to their ROM build.
 - To roll back, launch the original ROM with the original save backup and
   the stock **Flash 512 Kbit (64 KiB)** setting. To keep progress made while
   playing the patched ROM, extract the current lower bank instead.
