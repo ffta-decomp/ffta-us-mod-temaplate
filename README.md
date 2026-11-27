@@ -4,8 +4,12 @@ This patch lets you name an ordinary recruit with the original English
 keyboard in the North American release of Final Fantasy Tactics Advance.
 The editor opens with the candidate's original name and portrait. Press
 **START** to confirm the edited name or **SELECT** to keep the original name.
-The name is assigned when you accept the recruit and appears in the party
-card and unit details.
+The name is assigned when you accept the recruit and appears in the party,
+deployment, battle, and unit detail cards.
+
+After the opening clan naming scene, the ordinary starting companions can
+also be named with the stock keyboard. Press SELECT to keep each default
+name. The game retains its original names for named story characters.
 
 ## Patch the game
 

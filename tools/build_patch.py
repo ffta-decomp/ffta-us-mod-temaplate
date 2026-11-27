@@ -16,17 +16,23 @@ BASE = 0x08000000
 BODY = 0xE02000
 BRIDGE = 0x36D370
 FLASH_TABLE = 0xF30000
+RESIDENT_START = 0x0203F800
+RESIDENT_END = 0x0203FC00  # End of the native cold-boot clear.
+R_INFO_ARENA_END = 0x020327CC + 12 + 0xC600
+EDITOR_REQUEST = 108584
+FLASH_STACK_MIN = 0x03007800
+FLASH_STACK_LIMIT = FLASH_STACK_MIN - 0x0300616C - 0x600
 # Only callers that save live progress or load the selected file. The title
 # preview and temporary copies keep their original direct calls.
 SAVE_CALLS = (0x649F6, 0x64A82, 0x64B6E, 0xBD268, 0x13997A)
 LOAD_CALLS = (0x13AA28, 0x13AAC2)
 LINK_SCRIPT = f'''
 SECTIONS {{
-    .bridge {BASE + BRIDGE:#x} : {{ *(.bridge) }}
+    .bridge {BASE + BRIDGE:#x} : {{ *(.bridge) *(.bridge.clan) }}
     .text {BASE + BODY:#x} : {{ *(.text*) *(.rodata*) }}
     .data : {{ *(.data*) }}
     .bss : {{ *(.bss*) *(COMMON) }}
-    /DISCARD/ : {{ *(.ARM.exidx*) *(.ARM.extab*) *(.comment*) *(.note*) }}
+    /DISCARD/ : {{ *(.ARM.exidx*) *(.ARM.extab*) *(.comment*) *(.note*) *(.recruit_memory) }}
 }}
 ASSERT(SIZEOF(.data) == 0 && SIZEOF(.bss) == 0, "Unexpected RAM section")
 ASSERT(SIZEOF(.text) <= 0x2000 && SIZEOF(.bridge) <= 0x100, "ROM reservation exceeded")
@@ -63,7 +69,10 @@ def build_header(rom):
         'recruit_question_suffix': english_tokens(' to clan?') + choice,
         'recruit_joined_suffix': english_tokens(' joined the clan.') + b'\x40\x77\x40\x63\x00',
     }
-    rows = [f'#define NAMES_FIRST {min(names):#x}u', f'#define NAMES_END {max(names) + 1:#x}u']
+    rows = [f'#define STATE_ADDRESS {RESIDENT_START:#x}u',
+            f'#define RESIDENT_END {RESIDENT_END:#x}u',
+            f'#define FLASH_STACK_MIN {FLASH_STACK_MIN:#x}u',
+            f'#define NAMES_FIRST {min(names):#x}u', f'#define NAMES_END {max(names) + 1:#x}u']
     for name, data in messages.items():
         items = ', '.join(f'{value:#04x}' for value in data)
         rows.append(f'static const u8 {name}[] = {{ {items} }};')
@@ -78,8 +87,26 @@ def assemble(rom, clang, prefix):
         subprocess.run([clang, '--target=arm-none-eabi', '-mcpu=arm7tdmi', '-mthumb',
                         '-Os', '-std=c11', '-ffreestanding', '-fno-builtin',
                         '-fno-unwind-tables', '-fno-asynchronous-unwind-tables',
-                        '-Wall', '-Wextra', '-Werror', '-I', tmp, '-c',
+                        '-Wall', '-Wextra', '-Werror', '-fstack-usage', '-I', tmp, '-c',
                         ROOT / 'src/recruit.c', '-o', work / 'recruit.o'], check=True)
+        usage = work / 'recruit-memory.bin'
+        subprocess.run([prefix + 'objcopy', '-O', 'binary', '-j', '.recruit_memory',
+                        work / 'recruit.o', usage], check=True)
+        resident, editor, page = struct.unpack('<3I', usage.read_bytes())
+        frames = [row.split('\t') for row in (work / 'recruit.su').read_text().splitlines()]
+        writers = [(int(size), kind) for site, size, kind in frames if site.endswith(':write_sector')]
+        if len(writers) != 1 or writers[0][1] != 'static':
+            raise ValueError('Expected a statically bounded Flash writer')
+        writer = writers[0][0]
+        if RESIDENT_START % 4 or not R_INFO_ARENA_END <= RESIDENT_START < RESIDENT_END:
+            raise ValueError('Recruit state overlaps the deployment Info arena')
+        if not 0 < resident <= RESIDENT_END - RESIDENT_START:
+            raise ValueError('Recruit state exceeds its cold-cleared EWRAM reservation')
+        if editor != EDITOR_REQUEST or page != 4096 or not page <= writer <= FLASH_STACK_LIMIT:
+            raise ValueError('Recruit editor or Flash writer exceeds its memory budget')
+        memory = dict(ewram_start=hex(RESIDENT_START), ewram_reserved_bytes=RESIDENT_END-RESIDENT_START,
+                      resident_bytes=resident, editor_heap_request_bytes=editor,
+                      flash_page_bytes=page, flash_writer_stack_bytes=writer)
         elf = work / 'recruit.elf'
         subprocess.run([prefix + 'ld', '-T', work / 'recruit.ld',
                         work / 'recruit.o', '-o', elf], check=True)
@@ -94,7 +121,7 @@ def assemble(rom, clang, prefix):
             subprocess.run([prefix + 'objcopy', '-O', 'binary', '-j', '.' + name,
                             elf, target], check=True)
             sections[name] = target.read_bytes()
-    return symbols, sections
+    return symbols, sections, memory
 
 
 def install(rom, symbols, sections):
@@ -118,7 +145,10 @@ def install(rom, symbols, sections):
             struct.pack('<I', 0x080802E5))
     redirect('identify recruit Flash', 0x141DAC, 'IdentifyRecruitFlash', 0x1418C0)
     redirect('dialog text', 0x1181A, 'DialogBridge', 0x18028)
-    for offset in (0x743F6, 0x7563C):
+    if rom[0x9A863E:0x9A8640] != b'\x18\x0b':
+        raise ValueError('Unexpected opening clan name command')
+    redirect('opening clan editor', 0x12256E, 'ClanNameBridge', 0x12B230)
+    for offset in (0x2C094, 0x2C9A4, 0x743F6, 0x7563C):
         redirect('unit display name', offset, 'RenderNameBridge', 0xC7EA4)
     for offset in (0x807D0, 0x8097E):
         redirect('roster copy', offset, 'AcceptBridge', 0x1443FC)
@@ -159,7 +189,7 @@ def install(rom, symbols, sections):
 def build(rom, clang, prefix):
     if len(rom) != 0x1000000 or sha(rom) != RETAIL_SHA:
         raise ValueError('Expected the original 16 MiB North American ROM with game code AFXE')
-    symbols, sections = assemble(rom, clang, prefix)
+    symbols, sections, memory = assemble(rom, clang, prefix)
     patched, ranges = install(rom, symbols, sections)
     patch = encode_patch(rom, patched)
     if apply_patch(rom, patch) != patched:
@@ -173,6 +203,7 @@ def build(rom, clang, prefix):
         'recruit_body_bytes': len(sections['text']),
         'near_bridge_bytes': len(sections['bridge']),
         'touched_ranges': ranges,
+        'memory': memory,
     }
 
 

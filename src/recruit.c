@@ -12,7 +12,26 @@
 #define PALETTE_SHADOW ((u16 *)0x03003860)
 #define HARDWARE_PALETTE ((volatile u16 *)0x05000000)
 
-enum { ENCODING_US = 1 };
+enum {
+    ENCODING_US = 1,
+    RESOLVE_UNIT_PORTRAIT_ADDRESS = 0x080cb928,
+    ORIGINAL_CLAN_NAMING = 0x0812b230,
+    CREATE_SCENE_TASK = 0x08121b8c,
+    ACTIVE_SCENE_ID = 0x02002192,
+    OPENING_CLAN_SCENE = 10,
+    OPENING_CLAN_SCRIPT = 0x089a7e51,
+    OPENING_CLAN_NAME_PC = 0x7ed,
+    FIRST_STARTER_SLOT = 1,
+    LAST_STARTER_SLOT = 5,
+    EDITOR_BUTTON_SELECT = 1 << 2,
+    EDITOR_INITIALIZE_STATE = 256,
+    EDITOR_INPUT_STATE = 260,
+    EDITOR_CONFIRM_STATE = 262,
+    EDITOR_KEEP_ORIGINAL_STATE = 263,
+    EDITOR_RETURN_STATE = 264,
+    KEYBOARD_SURFACE_A_ADDRESS = 0x030008b0,
+    KEYBOARD_SURFACE_B_ADDRESS = 0x03000990,
+};
 
 struct Alias {
     u16 name_id;
@@ -51,16 +70,23 @@ struct Runtime {
     u8 editor_caller[8];
     u16 dialog[40];
     _Alignas(4) u8 draft[NAME_BYTES];
-    union {
-        struct EditorSession naming;
-        u8 flash_page[FLASH_SECTOR_BYTES];
-    } scratch;
+    struct EditorSession *editor_session;
+    const u8 *resolved_names[UNIT_COUNT];
+    const u8 *native_names[UNIT_COUNT];
+    u8 starter_slot;
 };
 
 enum { FRESH, EDITING, OFFERED, JOINED };
 #define STATE ((struct Runtime *)STATE_ADDRESS)
 #define ROSTER ((const struct Unit *)FIRST_UNIT)
-_Static_assert(sizeof(struct Runtime) <= 0x0203fff0u - STATE_ADDRESS, "reserved EWRAM");
+#define EDITOR_REQUEST_BYTES (sizeof(struct EditorSession) + GRAPHICS_BYTES + EDITOR_HEAP_BYTES)
+_Static_assert(sizeof(struct Runtime) <= RESIDENT_END - STATE_ADDRESS, "reserved EWRAM");
+
+/* The builder checks these ARM sizes before installing the payload. */
+__attribute__((used, section(".recruit_memory")))
+static const u32 memory_usage[] = {
+    sizeof(struct Runtime), EDITOR_REQUEST_BYTES, FLASH_SECTOR_BYTES
+};
 _Static_assert(sizeof(struct NameBlock) < 4096, "name sector");
 
 static void copy(u8 *dest, const u8 *src, unsigned size)
@@ -144,8 +170,11 @@ static void prune(void)
 {
     for (unsigned i = 0; i < UNIT_COUNT; ++i) {
         struct Alias *alias = &STATE->names.aliases[i];
-        if (!alias_matches(alias, &ROSTER[i]))
+        if (!alias_matches(alias, &ROSTER[i])) {
             clear(alias, sizeof(*alias));
+            STATE->native_names[i] = ROSTER[i].name;
+            STATE->resolved_names[i] = ROSTER[i].name;
+        }
     }
 }
 
@@ -163,6 +192,15 @@ static unsigned alias_is_displayable(const struct Alias *alias)
     return alias->name[0] != 0;
 }
 
+static void resolve_roster_name(unsigned index, const struct Unit *unit)
+{
+    const struct Alias *alias = &STATE->names.aliases[index];
+    STATE->native_names[index] = unit->name;
+    STATE->resolved_names[index] =
+        STATE->names.magic == MAGIC && alias_matches(alias, unit) && alias_is_displayable(alias)
+        ? alias->name : unit->name;
+}
+
 __attribute__((noinline))
 static const u8 *display_name(const struct Unit *unit)
 {
@@ -170,10 +208,10 @@ static const u8 *display_name(const struct Unit *unit)
         return STATE->draft;
     if (STATE->names.magic == MAGIC && unit->kind == 1) {
         unsigned index = roster_index(unit);
-        if (index < UNIT_COUNT) {
+        if (index < UNIT_COUNT && STATE->native_names[index] == unit->name) {
             const struct Alias *alias = &STATE->names.aliases[index];
-            if (alias_matches(alias, unit) && alias_is_displayable(alias))
-                return alias->name;
+            if (STATE->resolved_names[index] != alias->name || alias->race == unit->race)
+                return STATE->resolved_names[index];
         }
     }
     return unit->name;
@@ -208,7 +246,7 @@ static void transfer_graphics(u16 *buffer, unsigned restore)
 }
 _Static_assert(0x2000 + 0x3000 + 0x1800 + 0x5800 == GRAPHICS_BYTES, "graphics backup size");
 
-static unsigned reserve_editor_memory(struct EditorSession *session, const u8 *scene)
+static struct EditorSession *reserve_editor_memory(const u8 *scene)
 {
     void *owner = MAIN_HEAP;
     const u8 *arena = RAM(const u8 *, 0x03002778);
@@ -219,13 +257,13 @@ static unsigned reserve_editor_memory(struct EditorSession *session, const u8 *s
         (u32)scene - (u32)arena > RECRUIT_SCENE_BYTES - 0x1d10 ||
         HeapAllocationSize(owner, arena) < RECRUIT_SCENE_BYTES)
         return 0;
-    void *graphics = HeapAllocate(owner, GRAPHICS_BYTES + EDITOR_HEAP_BYTES);
-    if (!graphics)
+    struct EditorSession *session = HeapAllocate(owner, EDITOR_REQUEST_BYTES);
+    if (!session)
         return 0;
     session->owner_heap = owner;
-    session->graphics = graphics;
-    session->editor_heap = InitHeap((u8 *)graphics + GRAPHICS_BYTES, EDITOR_HEAP_BYTES);
-    return 1;
+    session->graphics = (u16 *)(session + 1);
+    session->editor_heap = InitHeap((u8 *)session->graphics + GRAPHICS_BYTES, EDITOR_HEAP_BYTES);
+    return session;
 }
 
 static void clear_keyboard_maps(struct EditorSession *session)
@@ -265,6 +303,134 @@ static void capture_draft(const struct NameEditor *editor)
     clear(STATE->draft + length, NAME_BYTES - length);
 }
 
+typedef u32 (*NameTask)(u32, struct NameEvent *, struct NameEditor *);
+
+static u16 starter_name_id(const struct Unit *unit)
+{
+    return unit->kind == 1 ? pool_id(unit->name) : 0;
+}
+
+static unsigned next_starter(unsigned after)
+{
+    for (unsigned i = after + 1; i <= LAST_STARTER_SLOT; ++i)
+        if (starter_name_id(&ROSTER[i]))
+            return i;
+    return 0;
+}
+
+/* The scheduler only carries event->state between frames. The native editor's
+ * payload owns the caller pointer. Reinitialize that same task after it has
+ * closed the previous editor and freed all of its windows and buffers. */
+static void start_next_starter(u32 task, struct NameEvent *event,
+                               struct NameEditor *editor, u8 *caller, unsigned slot)
+{
+    struct NameEvent init;
+    clear(&init, sizeof(init));
+    init.caller = caller;
+    init.kind = 1;
+    clear(STATE->draft, NAME_BYTES);
+    STATE->starter_slot = slot;
+    StockNameEditor(task, &init, editor);
+    event->state = EDITOR_INITIALIZE_STATE;
+    caller[6] = 0;
+}
+
+static u32 opening_name_task(u32 task, struct NameEvent *event, struct NameEditor *editor)
+{
+    unsigned slot = STATE->starter_slot;
+    const unsigned state = event->state;
+    if (!slot) {
+        u8 *caller = state ? editor->caller : event->caller;
+        u32 result = StockNameEditor(task, event, editor);
+        if (state == EDITOR_RETURN_STATE && event->state == 3) {
+            unsigned next = next_starter(FIRST_STARTER_SLOT - 1);
+            if (next)
+                start_next_starter(task, event, editor, caller, next);
+        }
+        return result;
+    }
+    const struct Unit *unit = &ROSTER[slot];
+    u8 original[NAME_BYTES];
+    if (state == EDITOR_INITIALIZE_STATE) {
+        u8 backup[NAME_BYTES];
+        prefill(original, unit->name);
+        copy(backup, LIVE_NAME, NAME_BYTES);
+        copy(LIVE_NAME, original, NAME_BYTES);
+        u32 result = StockNameEditor(task, event, editor);
+        copy(LIVE_NAME, backup, NAME_BYTES);
+        editor->portrait_unit = unit;
+        editor->portrait = NATIVE(RESOLVE_UNIT_PORTRAIT_ADDRESS, void *, (const struct Unit *))(unit);
+        return result;
+    }
+    const unsigned buttons = RAM(volatile u16, NAME_INPUT);
+    if (state == EDITOR_INPUT_STATE && (buttons & EDITOR_BUTTON_SELECT)) {
+        clear(STATE->draft, NAME_BYTES);
+        event->state = EDITOR_KEEP_ORIGINAL_STATE;
+        SetSound(104);
+        return 0;
+    }
+    if (state == EDITOR_CONFIRM_STATE && !editor->phase) {
+        capture_draft(editor);
+        prefill(original, unit->name);
+        if (same(STATE->draft, original, NAME_BYTES))
+            clear(STATE->draft, NAME_BYTES);
+        editor->reset = 0;
+        ShowDialog(editor->window, 1, 8, (void *)KEYBOARD_SURFACE_A_ADDRESS, (void *)KEYBOARD_SURFACE_B_ADDRESS,
+                   5, 5, 19, 4, NAME_TASK_BYTES);
+        SetDialogMode(2);
+        editor->phase = 1;
+        return 0;
+    }
+
+    u8 *caller = editor->caller;
+    u32 result = StockNameEditor(task, event, editor);
+    if (state == EDITOR_RETURN_STATE && event->state == 3) {
+        u16 id = starter_name_id(unit);
+        if (id && STATE->draft[0]) {
+            STATE->names.magic = MAGIC;
+            struct Alias *alias = &STATE->names.aliases[slot];
+            alias->name_id = id;
+            alias->race = unit->race;
+            alias->encoding = ENCODING_US;
+            copy(alias->name, STATE->draft, NAME_BYTES);
+            resolve_roster_name(slot, unit);
+        }
+        unsigned next = next_starter(slot);
+        if (next) {
+            start_next_starter(task, event, editor, caller, next);
+        } else {
+            clear(STATE->draft, NAME_BYTES);
+            STATE->starter_slot = 0;
+        }
+    }
+    return result;
+}
+
+__attribute__((used)) void StartOpeningNames(u8 *caller)
+{
+    const u16 pc = RAM(u16, (u32)caller);
+    if (RAM(u16, ACTIVE_SCENE_ID) != OPENING_CLAN_SCENE ||
+        RAM(u32, (u32)caller + 12) != OPENING_CLAN_SCRIPT ||
+        (pc != OPENING_CLAN_NAME_PC && pc != OPENING_CLAN_NAME_PC + 2) || !supports_bank()) {
+        NATIVE(ORIGINAL_CLAN_NAMING, void, (u8 *))(caller);
+        return;
+    }
+    clear(STATE, sizeof(*STATE));
+    struct NameEvent init;
+    clear(&init, sizeof(init));
+    init.caller = caller;
+    caller[6] = 0;
+    NATIVE(CREATE_SCENE_TASK, void *, (NameTask, u16, const void *, void *))(
+        opening_name_task, NAME_TASK_BYTES, &init, 0);
+}
+
+
+__attribute__((naked, used, aligned(4), section(".bridge.clan")))
+void ClanNameBridge(u8 *caller)
+{
+    __asm__("ldr r3, 1f\n bx r3\n .balign 4\n1: .word StartOpeningNames");
+}
+
 static u32 recruit_editor(u32 task, struct NameEvent *event, struct NameEditor *editor)
 {
     const unsigned state = event->state;
@@ -278,7 +444,7 @@ static u32 recruit_editor(u32 task, struct NameEvent *event, struct NameEditor *
     if (state == 256) {
         u8 backup[NAME_BYTES];
         copy(backup, LIVE_NAME, NAME_BYTES);
-        copy(LIVE_NAME, STATE->scratch.naming.original, NAME_BYTES);
+        copy(LIVE_NAME, STATE->editor_session->original, NAME_BYTES);
         u32 result = StockNameEditor(task, event, editor);
         copy(LIVE_NAME, backup, NAME_BYTES);
         editor->portrait_unit = STATE->candidate;
@@ -287,7 +453,7 @@ static u32 recruit_editor(u32 task, struct NameEvent *event, struct NameEditor *
     }
     if (state == 262 && editor->phase == 0) {
         capture_draft(editor);
-        if (same(STATE->draft, STATE->scratch.naming.original, NAME_BYTES))
+        if (same(STATE->draft, STATE->editor_session->original, NAME_BYTES))
             clear(STATE->draft, NAME_BYTES);
         editor->reset = 0;
         ShowDialog(editor->window, 1, 8, (void *)0x030008b0, (void *)0x03000990,
@@ -306,17 +472,20 @@ static u32 recruit_editor(u32 task, struct NameEvent *event, struct NameEditor *
 void RecruitStep(u32 task, u8 *step)
 {
     u8 *root = RAM(u8 *, 0x03002818);
-    struct EditorSession *session = &STATE->scratch.naming;
+    struct EditorSession *session = STATE->editor_session;
     if (*step == 0 && (u32)root >= 0x0200f390 &&
         (u32)root <= STATE_ADDRESS - RECRUIT_SCENE_BYTES &&
         RAM(u32, 0x03000e54) == RECRUIT_SCENE_BYTES) {
         const struct Unit *slot = RAM(const struct Unit *, LIVE_SAVE + 0x2c78);
         const struct Unit *unit = RAM(const struct Unit *, (u32)root + 0x1d0c);
+        u8 original[NAME_BYTES];
         if (STATE->stage == FRESH && (u32)slot >= FIRST_UNIT &&
             (u32)slot < FIRST_UNIT + sizeof(*slot)*UNIT_COUNT && slot->kind == 0 &&
             candidate_is_generic(unit) &&
-            supports_bank() && prefill(session->original, unit->name) &&
-            reserve_editor_memory(session, root)) {
+            supports_bank() && prefill(original, unit->name) &&
+            (session = reserve_editor_memory(root))) {
+            STATE->editor_session = session;
+            copy(session->original, original, NAME_BYTES);
             clear(STATE->draft, NAME_BYTES);
             clear(&session->event, sizeof(session->event));
             clear(session->editor, sizeof(session->editor));
@@ -365,10 +534,11 @@ void RecruitStep(u32 task, u8 *step)
             copy((u8 *)0x030008b0, session->surface_a, sizeof(session->surface_a));
             copy((u8 *)0x03000990, session->surface_b, sizeof(session->surface_b));
             transfer_graphics(session->graphics, 1);
-            HeapFree(session->owner_heap, session->graphics);
             copy_halfwords((u16 *)0x06008000, session->blank_tile, sizeof(session->blank_tile));
             copy_halfwords(PALETTE_SHADOW, session->palette, sizeof(session->palette));
             copy_halfwords(HARDWARE_PALETTE, session->palette, sizeof(session->palette));
+            HeapFree(session->owner_heap, session);
+            STATE->editor_session = 0;
             STATE->stage = OFFERED;
         }
     }
@@ -401,6 +571,7 @@ void *RecruitAccepted(void *destination, const void *source, unsigned bytes)
                 copy(alias->name, STATE->draft, NAME_BYTES);
             }
         }
+        resolve_roster_name(index, unit);
     }
     STATE->candidate = 0;
     return destination;
@@ -518,7 +689,8 @@ static unsigned read_names(const u8 *image, u8 slot, u8 sector)
 {
     if (!supports_bank())
         return 0;
-    struct NameBlock *block = (struct NameBlock *)STATE->scratch.flash_page;
+    struct NameBlock buffer;
+    struct NameBlock *block = &buffer;
     switch_bank(1);
     NativeRead(sector, 0, block, sizeof(*block));
     switch_bank(0);
@@ -527,6 +699,9 @@ static unsigned read_names(const u8 *image, u8 slot, u8 sector)
         block->names_crc != NameCrc(block->aliases, sizeof(block->aliases), 0))
         return 0;
     copy((u8 *)&STATE->names, (const u8 *)block, sizeof(*block));
+    const struct Unit *units = (const struct Unit *)(image + (FIRST_UNIT - LIVE_SAVE));
+    for (unsigned i = 0; i < UNIT_COUNT; ++i)
+        resolve_roster_name(i, &units[i]);
     return 1;
 }
 
@@ -546,6 +721,27 @@ static u32 recruit_load(u8 slot, u8 *image, u32 caller)
     return status;
 }
 
+/* Keep the synchronous Flash buffer on IWRAM, outside the live game heaps. */
+__attribute__((noinline))
+static u32 write_sector(u8 sector)
+{
+    _Alignas(4) u8 page[FLASH_SECTOR_BYTES];
+    for (unsigned i = 0; i < FLASH_SECTOR_BYTES; ++i)
+        page[i] = 0xff;
+    copy(page, (const u8 *)&STATE->names, sizeof(STATE->names));
+    switch_bank(1);
+    u32 failed = NativeWrite(sector, page);
+    switch_bank(0);
+    return failed;
+}
+
+static u32 write_names(u8 sector)
+{
+    u32 stack;
+    __asm__ volatile ("mov %0, sp" : "=r"(stack));
+    return stack < FLASH_STACK_MIN || stack > 0x03007ec0u ? 1 : write_sector(sector);
+}
+
 __attribute__((noinline))
 static u32 recruit_save(u8 slot, u8 *image)
 {
@@ -561,14 +757,7 @@ static u32 recruit_save(u8 slot, u8 *image)
     STATE->names.sequence = RAM(u32, LIVE_SAVE+8);
     STATE->names.native_crc = RAM(u32, LIVE_SAVE+12);
     STATE->names.names_crc = NameCrc(STATE->names.aliases, sizeof(STATE->names.aliases), 0);
-    u8 *page = STATE->scratch.flash_page;
-    for (unsigned i = 0; i < FLASH_SECTOR_BYTES; ++i)
-        page[i] = 0xff;
-    copy(page, (const u8 *)&STATE->names, sizeof(STATE->names));
-    switch_bank(1);
-    u32 failed = NativeWrite(sectors[2], page);
-    switch_bank(0);
-    return failed ? 0 : status;
+    return write_names(sectors[2]) ? 0 : status;
 }
 
 __attribute__((section(".bridge")))

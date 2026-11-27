@@ -13,7 +13,6 @@ enum {
     NAME_POOL_COUNT = 725,
     NAME_BYTES = 20,
     NAME_TASK_BYTES = 820,
-    STATE_ADDRESS = 0x0203ed20,
     LIVE_SAVE = 0x02000000,
     FIRST_UNIT = 0x02000080,
     GENERATED_UNIT = 0x02002fc4,
@@ -39,7 +38,8 @@ struct NameEvent {
 };
 
 struct NameEditor {
-    u8 unused[0x298];
+    u8 *caller;
+    u8 unused_04[0x298 - 4];
     void *portrait;
     const struct Unit *portrait_unit;
     u8 unused_2a0[0x312 - 0x2a0];
