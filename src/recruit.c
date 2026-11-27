@@ -24,11 +24,25 @@ enum {
     FIRST_STARTER_SLOT = 1,
     LAST_STARTER_SLOT = 5,
     EDITOR_BUTTON_SELECT = 1 << 2,
+    EDITOR_PROTAGONIST_LAYOUT = 1,
+    EDITOR_TASK_COMPLETE_STATE = 3,
     EDITOR_INITIALIZE_STATE = 256,
     EDITOR_INPUT_STATE = 260,
     EDITOR_CONFIRM_STATE = 262,
-    EDITOR_KEEP_ORIGINAL_STATE = 263,
+    EDITOR_CLOSE_STATE = 263,
     EDITOR_RETURN_STATE = 264,
+    NAME_CONFIRM_SHOW = 0,
+    NAME_CONFIRM_WAIT = 1,
+    NAME_DIALOG_FIXED_PAGE = 1,
+    NAME_DIALOG_CONFIRM_RECORD = 8,
+    NAME_DIALOG_MODE = 2,
+    NAME_DIALOG_YES = 0,
+    NAME_DIALOG_TILE_INDEX = 928,
+    EDITOR_SURFACE_DATA_OFFSET = 20,
+    EDITOR_CLEAR_SURFACE = 0x01000400, /* CpuSet fill, 1024 halfwords. */
+    KEYBOARD_BLANK_TILE_VRAM = 0x06008000,
+    KEYBOARD_BG2_MAP_VRAM = 0x06005000,
+    KEYBOARD_BG3_MAP_VRAM = 0x0600e000,
     KEYBOARD_SURFACE_A_ADDRESS = 0x030008b0,
     KEYBOARD_SURFACE_B_ADDRESS = 0x03000990,
 };
@@ -327,12 +341,28 @@ static void start_next_starter(u32 task, struct NameEvent *event,
     struct NameEvent init;
     clear(&init, sizeof(init));
     init.caller = caller;
-    init.kind = 1;
+    init.kind = EDITOR_PROTAGONIST_LAYOUT;
     clear(STATE->draft, NAME_BYTES);
     STATE->starter_slot = slot;
     StockNameEditor(task, &init, editor);
     event->state = EDITOR_INITIALIZE_STATE;
     caller[6] = 0;
+}
+
+static void close_starter_editor(struct NameEditor *editor)
+{
+    /* The native save-name close also regenerates party defaults. This
+     * editor owns the keyboard allocations and display only. */
+    for (unsigned i = 0; i < sizeof(editor->buffers) / sizeof(editor->buffers[0]); ++i)
+        FreeNameBuffer(editor->buffers[i]);
+    DestroyNameWindow(editor->window);
+
+    const u16 fill = 0;
+    BiosCpuSet(&fill, RAM(void *, KEYBOARD_SURFACE_A_ADDRESS + EDITOR_SURFACE_DATA_OFFSET), EDITOR_CLEAR_SURFACE);
+    BiosCpuSet(&fill, RAM(void *, KEYBOARD_SURFACE_B_ADDRESS + EDITOR_SURFACE_DATA_OFFSET), EDITOR_CLEAR_SURFACE);
+    RestoreNameDisplay();
+    ConfigureNameBackground(2, 1, 0, 0, 0, (void *)KEYBOARD_BLANK_TILE_VRAM, (void *)KEYBOARD_BG3_MAP_VRAM);
+    ConfigureNameBackground(3, 1, 1, 0, 0, (void *)KEYBOARD_BLANK_TILE_VRAM, (void *)KEYBOARD_BG2_MAP_VRAM);
 }
 
 static u32 opening_name_task(u32 task, struct NameEvent *event, struct NameEditor *editor)
@@ -342,7 +372,7 @@ static u32 opening_name_task(u32 task, struct NameEvent *event, struct NameEdito
     if (!slot) {
         u8 *caller = state ? editor->caller : event->caller;
         u32 result = StockNameEditor(task, event, editor);
-        if (state == EDITOR_RETURN_STATE && event->state == 3) {
+        if (state == EDITOR_RETURN_STATE && event->state == EDITOR_TASK_COMPLETE_STATE) {
             unsigned next = next_starter(FIRST_STARTER_SLOT - 1);
             if (next)
                 start_next_starter(task, event, editor, caller, next);
@@ -350,14 +380,15 @@ static u32 opening_name_task(u32 task, struct NameEvent *event, struct NameEdito
         return result;
     }
     const struct Unit *unit = &ROSTER[slot];
-    u8 original[NAME_BYTES];
     if (state == EDITOR_INITIALIZE_STATE) {
-        u8 backup[NAME_BYTES];
-        prefill(original, unit->name);
-        copy(backup, LIVE_NAME, NAME_BYTES);
-        copy(LIVE_NAME, original, NAME_BYTES);
         u32 result = StockNameEditor(task, event, editor);
-        copy(LIVE_NAME, backup, NAME_BYTES);
+        /* The shared initializer allocates the editor. Seed its private
+         * text before the later stages load and draw the keyboard. */
+        u8 original[NAME_BYTES];
+        prefill(original, unit->name);
+        copy(editor->name, original, sizeof(editor->name));
+        editor->length = NameByteLength(editor->name) >> 1;
+        PadEditedName(editor->name);
         editor->portrait_unit = unit;
         editor->portrait = NATIVE(RESOLVE_UNIT_PORTRAIT_ADDRESS, void *, (const struct Unit *))(unit);
         return result;
@@ -365,45 +396,58 @@ static u32 opening_name_task(u32 task, struct NameEvent *event, struct NameEdito
     const unsigned buttons = RAM(volatile u16, NAME_INPUT);
     if (state == EDITOR_INPUT_STATE && (buttons & EDITOR_BUTTON_SELECT)) {
         clear(STATE->draft, NAME_BYTES);
-        event->state = EDITOR_KEEP_ORIGINAL_STATE;
+        event->state = EDITOR_CLOSE_STATE;
         SetSound(104);
         return 0;
     }
-    if (state == EDITOR_CONFIRM_STATE && !editor->phase) {
-        capture_draft(editor);
-        prefill(original, unit->name);
-        if (same(STATE->draft, original, NAME_BYTES))
-            clear(STATE->draft, NAME_BYTES);
-        editor->reset = 0;
-        ShowDialog(editor->window, 1, 8, (void *)KEYBOARD_SURFACE_A_ADDRESS, (void *)KEYBOARD_SURFACE_B_ADDRESS,
-                   5, 5, 19, 4, NAME_TASK_BYTES);
-        SetDialogMode(2);
-        editor->phase = 1;
+    if (state == EDITOR_CONFIRM_STATE) {
+        editor->tick_flag = 0;
+        if (editor->phase == NAME_CONFIRM_SHOW) {
+            ShowDialog(editor->window, NAME_DIALOG_FIXED_PAGE, NAME_DIALOG_CONFIRM_RECORD,
+                       (void *)KEYBOARD_SURFACE_A_ADDRESS, (void *)KEYBOARD_SURFACE_B_ADDRESS,
+                       5, 5, 19, 4, NAME_DIALOG_TILE_INDEX);
+            SetDialogMode(NAME_DIALOG_MODE);
+            editor->phase = NAME_CONFIRM_WAIT;
+        } else if ((u16)PollDialog()) {
+            if ((u8)ReadDialogChoice() == NAME_DIALOG_YES) {
+                u8 original[NAME_BYTES];
+                capture_draft(editor);
+                prefill(original, unit->name);
+                if (same(STATE->draft, original, NAME_BYTES))
+                    clear(STATE->draft, NAME_BYTES);
+                event->state = EDITOR_CLOSE_STATE;
+            } else {
+                event->state = EDITOR_INPUT_STATE;
+            }
+        }
+        DrawNameConfirmation(editor);
         return 0;
     }
 
-    u8 *caller = editor->caller;
-    u32 result = StockNameEditor(task, event, editor);
-    if (state == EDITOR_RETURN_STATE && event->state == 3) {
-        u16 id = starter_name_id(unit);
-        if (id && STATE->draft[0]) {
-            STATE->names.magic = MAGIC;
-            struct Alias *alias = &STATE->names.aliases[slot];
-            alias->name_id = id;
-            alias->race = unit->race;
-            alias->encoding = ENCODING_US;
-            copy(alias->name, STATE->draft, NAME_BYTES);
-            resolve_roster_name(slot, unit);
-        }
-        unsigned next = next_starter(slot);
-        if (next) {
-            start_next_starter(task, event, editor, caller, next);
-        } else {
-            clear(STATE->draft, NAME_BYTES);
-            STATE->starter_slot = 0;
-        }
+    if (state != EDITOR_RETURN_STATE)
+        return StockNameEditor(task, event, editor);
+
+    close_starter_editor(editor);
+    u16 id = starter_name_id(unit);
+    if (id && STATE->draft[0]) {
+        STATE->names.magic = MAGIC;
+        struct Alias *alias = &STATE->names.aliases[slot];
+        alias->name_id = id;
+        alias->race = unit->race;
+        alias->encoding = ENCODING_US;
+        copy(alias->name, STATE->draft, NAME_BYTES);
+        resolve_roster_name(slot, unit);
     }
-    return result;
+    unsigned next = next_starter(slot);
+    if (next) {
+        start_next_starter(task, event, editor, editor->caller, next);
+    } else {
+        clear(STATE->draft, NAME_BYTES);
+        STATE->starter_slot = 0;
+        editor->caller[6] = 1;
+        event->state = EDITOR_TASK_COMPLETE_STATE;
+    }
+    return 0;
 }
 
 __attribute__((used)) void StartOpeningNames(u8 *caller)

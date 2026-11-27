@@ -8,8 +8,10 @@ The name is assigned when you accept the recruit and appears in the party,
 deployment, battle, and unit detail cards.
 
 After the opening clan naming scene, the ordinary starting companions can
-also be named with the stock keyboard. Press SELECT to keep each default
-name. The game retains its original names for named story characters.
+also be named with the stock keyboard. Press START to confirm, choose No to
+continue editing, or press SELECT to keep each default name. Each confirmed
+name stays with its companion as the remaining editors open. The game retains
+its original names for named story characters.
 
 ## Patch the game
 
